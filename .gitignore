@@ -105,3 +105,9 @@ ref/*
 
 # temp
 .temp/*
+
+# Obsidian
+.obsidian/*
+
+# .vscode
+.vscode/*
