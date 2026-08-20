@@ -111,3 +111,6 @@ ref/*
 
 # .vscode
 .vscode/*
+
+# bench
+**/bench_results/*

@@ -84,6 +84,7 @@ def torch_naive_sparse_attention_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
+    topk_length: torch.Tensor,
     softmax_scale,
     hidden_dim,
 ):
@@ -91,6 +92,12 @@ def torch_naive_sparse_attention_decode(
     block_size = kv_cache.shape[1]
 
     invalid_mask = indices < 0
+    if topk_length is not None:
+        topk = indices.shape[-1]
+        B = q.shape[0]
+        topk_range = torch.arange(topk, device=topk_length.device).view(1, 1, topk)
+        invalid_mask |= topk_range >= topk_length.view(B, 1, 1)
+
     safe_indices = indices.clamp(min=0)
 
     # gather kv [B, S, H, D]

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
 import torch
+import triton
 
 from kernel.deepseek_v4.sparse_decode_torch import (
     torch_naive_sparse_attention_decode,
@@ -21,6 +24,8 @@ NUM_TILES = NOPE_DIM // TILE_SIZE
 DATA_BYTES = NOPE_DIM + ROPE_DIM * 2
 SCALE_BYTES = NUM_TILES + 1
 BYTES_PER_TOKEN = DATA_BYTES + SCALE_BYTES
+RANDOMSEED = (11, 23, 37, 53, 71)
+BENCH_RESULTS_DIR = Path(__file__).resolve().parent / "bench_results"
 
 
 def _build_kvcache(
@@ -133,6 +138,27 @@ def _build_q_indices(
     return q, indices
 
 
+def _build_topk_length(
+    batch_size: int,
+    topk: int,
+    *,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """Build per-request valid prefix lengths for a fixed-width indices tensor."""
+    if topk <= 1:
+        return torch.ones(batch_size, dtype=torch.int32, device=device)
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randint(
+        low=max(1, topk // 2),
+        high=topk,
+        size=(batch_size,),
+        generator=generator,
+        dtype=torch.int32,
+    ).to(device)
+
+
 class TestSparseDecodeTritonVsTorch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -164,24 +190,41 @@ class TestSparseDecodeTritonVsTorch(unittest.TestCase):
             device=self.device,
             seed=seed + 100,
         )
+        topk_length = _build_topk_length(
+            batch_size,
+            topk,
+            device=self.device,
+            seed=seed + 200,
+        )
+
+        # The Triton path receives valid physical indices in the padded tail and
+        # must ignore them using TopkLength. The Torch oracle expresses the same
+        # logical input by replacing that tail with its existing -1 sentinel.
+        topk_rank = torch.arange(topk, device=self.device).view(1, 1, topk)
+        ref_indices = indices.masked_fill(
+            topk_rank >= topk_length.view(batch_size, 1, 1),
+            -1,
+        )
         softmax_scale = HEAD_DIM**-0.5
 
-        ref_out, _ = torch_naive_sparse_attention_decode(
+        ref_out, ref_lse = torch_naive_sparse_attention_decode(
             q,
             k_cache,
-            indices,
+            ref_indices,
+            topk_length,
             softmax_scale,
             HEAD_DIM,
         )
-        tri_out, _ = launch_sparse_fused_gather_attention_decode(
+        tri_out, tri_lse = launch_sparse_fused_gather_attention_decode(
             q.reshape(batch_size, num_heads, HEAD_DIM),
             k_cache,
             indices.reshape(batch_size, topk),
             page_size,
-            TopkLength=None,
+            TopkLength=topk_length,
             Seq_len=1,
         )
         tri_out = tri_out.reshape(batch_size, 1, num_heads, HEAD_DIM)
+        tri_lse = tri_lse.reshape(batch_size, 1, num_heads).permute(0, 2, 1)
         torch.cuda.synchronize()
 
         torch.testing.assert_close(
@@ -190,10 +233,134 @@ class TestSparseDecodeTritonVsTorch(unittest.TestCase):
             atol=1e-2,
             rtol=1e-2,
         )
+        torch.testing.assert_close(
+            tri_lse.float(),
+            ref_lse.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
     def test_basic(self):
-        self._run()
+        for seed in RANDOMSEED:
+            with self.subTest(seed=seed):
+                self._run(seed=seed)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["context_len"],
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
+        x_log=True,
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch"],
+        styles=[("blue", "-"), ("green", "-")],
+        xlabel="Context length",
+        ylabel="Latency (us)",
+        plot_name="sparse-decode-context-length-topk128-latency",
+        args={
+            "batch_size": 1,
+            "num_heads": 16,
+            "page_size": 64,
+            "topk": 128,
+            "seed": RANDOMSEED[0],
+        },
+    )
+)
+@torch.inference_mode()
+def benchmark_latency(
+    context_len: int,
+    provider: str,
+    batch_size: int,
+    num_heads: int,
+    page_size: int,
+    topk: int,
+    seed: int,
+):
+    """Benchmark fixed-topk sparse decode while growing the KV context."""
+    device = torch.device("cuda")
+    if context_len < topk:
+        raise ValueError(f"context_len={context_len} must be >= topk={topk}")
+    num_pages = (context_len + page_size - 1) // page_size
+
+    k_cache, _ = _build_kvcache(
+        num_pages,
+        page_size,
+        device=device,
+        seed=seed,
+    )
+    q, indices = _build_q_indices(
+        batch_size,
+        num_heads,
+        topk,
+        num_pages,
+        page_size,
+        device=device,
+        seed=seed + 100,
+    )
+    topk_length = torch.full(
+        (batch_size,),
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    softmax_scale = HEAD_DIM**-0.5
+
+    q_flat = q.reshape(batch_size, num_heads, HEAD_DIM)
+    indices_flat = indices.reshape(batch_size, topk)
+
+    if provider == "torch":
+
+        def torch_fn():
+            return torch_naive_sparse_attention_decode(
+                q,
+                k_cache,
+                indices,
+                topk_length,
+                softmax_scale,
+                HEAD_DIM,
+            )
+
+        benchmark_fn = torch_fn
+
+    elif provider == "triton":
+
+        def triton_fn():
+            return launch_sparse_fused_gather_attention_decode(
+                q_flat,
+                k_cache,
+                indices_flat,
+                page_size,
+                TopkLength=topk_length,
+                Seq_len=1,
+            )
+
+        benchmark_fn = triton_fn
+
+    else:
+        raise ValueError(f"unknown provider: {provider}")
+
+    timings = triton.testing.do_bench(
+        benchmark_fn,
+        warmup=100,
+        rep=500,
+        quantiles=[0.5, 0.2, 0.8],
+    )
+    if not isinstance(timings, (list, tuple)) or len(timings) != 3:
+        raise TypeError(f"unexpected do_bench result: {timings!r}")
+
+    median_ms, p20_ms, p80_ms = (float(value) for value in timings)
+    return median_ms * 1000, p20_ms * 1000, p80_ms * 1000
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if "--bench" in sys.argv:
+        BENCH_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        benchmark_latency.run(
+            show_plots=False,
+            print_data=False,
+            save_path=str(BENCH_RESULTS_DIR),
+        )
+    else:
+        unittest.main(verbosity=2)
