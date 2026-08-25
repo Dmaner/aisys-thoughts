@@ -5,6 +5,12 @@
 *.ptx
 *.cubin
 *.fatbin
+/kernel/cuda/demo
+/kernel/gemv/gemv
+/kernel/ncu/ncu_tutorial
+
+# Nsight Compute reports
+*.ncu-rep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
