@@ -16,10 +16,13 @@
     projectsShell: document.querySelector("[data-projects-shell]"),
     projectTimeline: document.querySelector("[data-project-timeline]"),
     articleShell: document.querySelector("[data-article-shell]"),
+    articleToc: document.querySelector("[data-article-toc]"),
     markdownBody: document.querySelector("[data-markdown-body]"),
     articleMeta: document.querySelector("[data-article-meta]"),
     backHome: document.querySelector("[data-back-home]"),
   };
+  let articleTocCleanup = null;
+  let articleRenderToken = 0;
 
   /* Applies saved light/dark preference and persists future theme changes. */
   function initTheme() {
@@ -48,7 +51,121 @@
     });
   }
 
+  function clearArticleToc() {
+    articleTocCleanup?.();
+    articleTocCleanup = null;
+    nodes.articleShell.classList.remove("has-article-toc");
+    nodes.articleToc.hidden = true;
+    nodes.articleToc.replaceChildren();
+  }
+
+  function renderArticleToc() {
+    clearArticleToc();
+
+    const headings = Array.from(nodes.markdownBody.querySelectorAll("h2, h3"));
+    if (!headings.length) return;
+
+    const tocList = document.createElement("nav");
+    tocList.className = "article-toc-list";
+    tocList.setAttribute("aria-label", "Article sections");
+
+    const buttons = headings.map((heading, index) => {
+      const headingId = `article-section-${index + 1}`;
+      const level = heading.tagName.toLowerCase();
+      const button = document.createElement("button");
+
+      heading.id = headingId;
+      heading.classList.add("article-section-heading");
+      button.type = "button";
+      button.className = `article-toc-link article-toc-link--${level}`;
+      button.textContent = heading.textContent.trim();
+      button.setAttribute("aria-controls", headingId);
+      button.addEventListener("click", () => {
+        const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        heading.scrollIntoView({
+          behavior: reducedMotion ? "auto" : "smooth",
+          block: "start",
+        });
+      });
+      tocList.append(button);
+      return button;
+    });
+
+    nodes.articleToc.append(tocList);
+    nodes.articleToc.hidden = false;
+    nodes.articleShell.classList.add("has-article-toc");
+
+    let activeIndex = -1;
+    let animationFrame = null;
+
+    function keepActiveButtonVisible(button) {
+      if (!button || tocList.clientHeight === 0) return;
+
+      const viewTop = tocList.scrollTop;
+      const viewBottom = viewTop + tocList.clientHeight;
+      const buttonTop = button.offsetTop;
+      const buttonBottom = buttonTop + button.offsetHeight;
+
+      if (buttonTop < viewTop) tocList.scrollTop = buttonTop;
+      else if (buttonBottom > viewBottom) {
+        tocList.scrollTop = buttonBottom - tocList.clientHeight;
+      }
+    }
+
+    function setActiveHeading(nextIndex) {
+      if (nextIndex === activeIndex) {
+        keepActiveButtonVisible(buttons[nextIndex]);
+        return;
+      }
+      activeIndex = nextIndex;
+
+      buttons.forEach((button, index) => {
+        const isActive = index === activeIndex;
+        button.classList.toggle("is-active", isActive);
+        if (isActive) button.setAttribute("aria-current", "location");
+        else button.removeAttribute("aria-current");
+      });
+
+      keepActiveButtonVisible(buttons[activeIndex]);
+    }
+
+    function updateActiveHeading() {
+      animationFrame = null;
+      const activationLine = Math.min(96, window.innerHeight * 0.12);
+      let nextIndex = 0;
+
+      const pageBottom = window.scrollY + window.innerHeight;
+      const documentBottom = document.documentElement.scrollHeight;
+      const hasScrollablePage = documentBottom - window.innerHeight > 2;
+      if (hasScrollablePage && pageBottom >= documentBottom - 2) {
+        nextIndex = headings.length - 1;
+      } else {
+        headings.forEach((heading, index) => {
+          if (heading.getBoundingClientRect().top <= activationLine) nextIndex = index;
+        });
+      }
+      setActiveHeading(nextIndex);
+    }
+
+    function scheduleActiveHeadingUpdate() {
+      if (animationFrame !== null) return;
+      animationFrame = window.requestAnimationFrame(updateActiveHeading);
+    }
+
+    window.addEventListener("scroll", scheduleActiveHeadingUpdate, { passive: true });
+    window.addEventListener("resize", scheduleActiveHeadingUpdate);
+    updateActiveHeading();
+
+    articleTocCleanup = () => {
+      if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("scroll", scheduleActiveHeadingUpdate);
+      window.removeEventListener("resize", scheduleActiveHeadingUpdate);
+    };
+  }
+
   function showHome() {
+    articleRenderToken += 1;
+    clearArticleToc();
     nodes.articleShell.hidden = true;
     nodes.blogIndexShell.hidden = true;
     nodes.projectsShell.hidden = true;
@@ -56,6 +173,8 @@
   }
 
   function showBlogIndex() {
+    articleRenderToken += 1;
+    clearArticleToc();
     nodes.articleShell.hidden = true;
     nodes.blogIndexShell.hidden = false;
     nodes.projectsShell.hidden = true;
@@ -64,6 +183,8 @@
   }
 
   function showProjects() {
+    articleRenderToken += 1;
+    clearArticleToc();
     nodes.articleShell.hidden = true;
     nodes.blogIndexShell.hidden = true;
     nodes.projectsShell.hidden = false;
@@ -90,11 +211,13 @@
       showHome();
       return;
     }
+    const renderToken = ++articleRenderToken;
 
     setHomeSectionsHidden(true);
     nodes.blogIndexShell.hidden = true;
     nodes.projectsShell.hidden = true;
     nodes.articleShell.hidden = false;
+    clearArticleToc();
     renderArticleMeta(item);
     nodes.markdownBody.innerHTML = "<p>Loading Markdown...</p>";
 
@@ -106,6 +229,7 @@
       nodes.markdownBody.innerHTML = item.markdown.trim()
         ? markdownToHtml(item.markdown, { title: item.title })
         : `<p>This Markdown file is currently empty.</p>`;
+      renderArticleToc();
       window.scrollTo({ top: 0, behavior: "smooth" });
       return;
     }
@@ -114,6 +238,7 @@
       const response = await fetch(item.path);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const markdown = await response.text();
+      if (renderToken !== articleRenderToken) return;
       const metadata = parsePostMetadata(markdown);
       const tags = uniqueTags(metadata.tags.length ? metadata.tags : item.tags || []);
       const description = metadata.desc || item.description;
@@ -121,8 +246,11 @@
       nodes.markdownBody.innerHTML = markdown.trim()
         ? markdownToHtml(markdown, { title: item.title })
         : `<p>This Markdown file is currently empty.</p><p><a href="${escapeHtml(item.path)}">Open raw Markdown</a></p>`;
+      renderArticleToc();
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch {
+      if (renderToken !== articleRenderToken) return;
+      clearArticleToc();
       nodes.markdownBody.innerHTML = `
         <p>This post is missing embedded Markdown content.</p>
         <p>Run <code>node website/tools/embed-markdown.mjs</code> from the repository root, then refresh this page.</p>
